@@ -7,7 +7,7 @@ description = "Tunnel UDP traffic inside a TCP stream. Each datagram is prefixed
 repository = "https://github.com/mullvad/udp-over-tcp"
 edition = "2024"
 rust-version = "1.85.0"
-publish = false
+publish = true
 
 [[bin]]
 name = "tcp2udp"
