@@ -32,6 +32,7 @@ err-context = "0.1.0"
 log = "0.4.11"
 futures = "0.3.31"
 socket2 = "0.5"
+bytes = "1.0"
 clap = { version = "4.0", features = ["derive"], optional = true }
 
 # Only used by the binaries in src/bin/ and is optional so it's not
