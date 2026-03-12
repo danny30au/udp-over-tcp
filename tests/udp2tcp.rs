@@ -137,7 +137,7 @@ async fn setup_udp2tcp() -> Result<
     udp_socket.send(&[]).await?;
     let mut tcp_stream = tcp_listener.accept().await?.0;
     let mut buf = [0; 1024];
-    tcp_stream.read(&mut buf).await?;
+    tcp_stream.read_exact(&mut buf).await?;
 
     Ok((udp_socket, tcp_stream, join_handle))
 }
