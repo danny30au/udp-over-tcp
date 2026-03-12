@@ -71,7 +71,7 @@ jobs:
           - os: ubuntu-latest
             rust: nightly
           - os: ubuntu-latest
-            rust: "1.82.0"    # MSRV
+            rust: "1.85.0"    # MSRV
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
