@@ -1,6 +1,6 @@
-use socket2::Socket;
 use err_context::BoxedErrorExt as _;
 use err_context::ResultExt as _;
+use socket2::Socket;
 use std::io;
 use std::mem;
 use std::sync::Arc;
@@ -20,16 +20,17 @@ pub async fn process_udp_over_tcp(
     tcp_stream: TcpStream,
     tcp_recv_timeout: Option<Duration>,
 ) {
-    // 1. Buffer Size Improvements
-    // Convert to std::net::UdpSocket to access buffer size settings
+    // 1. Buffer Size Improvements using socket2
     let std_udp = udp_socket.into_std().expect("Failed to get std socket");
     
-    // Call the methods on `std_udp` (NOT udp_socket)
-    let _ = std_udp.set_recv_buffer_size(4 * 1024 * 1024);
-    let _ = std_udp.set_send_buffer_size(4 * 1024 * 1024);
-    let _ = std_udp.set_nonblocking(true); // Ensure it stays non-blocking for Tokio
+    // Convert to socket2::Socket to access OS-level buffer tuning
+    let sock = Socket::from(std_udp);
+    let _ = sock.set_recv_buffer_size(4 * 1024 * 1024);
+    let _ = sock.set_send_buffer_size(4 * 1024 * 1024);
+    let _ = sock.set_nonblocking(true); // Ensure it stays non-blocking
     
-    // Restore back to tokio::net::UdpSocket
+    // Convert back down to std::net::UdpSocket, then to tokio::net::UdpSocket
+    let std_udp: std::net::UdpSocket = sock.into();
     let udp_socket = UdpSocket::from_std(std_udp).expect("Failed to restore tokio socket");
 
     // Disable Nagle's algorithm to reduce latency for small UDP datagrams
@@ -41,15 +42,13 @@ pub async fn process_udp_over_tcp(
 
     let mut tcp2udp_handle = tokio::spawn(async move {
         if let Err(error) = process_tcp2udp(tcp_in, udp_out, tcp_recv_timeout).await {
-            log::error!("TCP->UDP Error: {}", error.display("
-Caused by: "));
+            log::error!("TCP->UDP Error: {}", error.display("\nCaused by: "));
         }
     });
 
     let mut udp2tcp_handle = tokio::spawn(async move {
         if let Err(error) = process_udp2tcp(udp_in, tcp_out).await {
-            log::error!("UDP->TCP Error: {}", error.display("
-Caused by: "));
+            log::error!("UDP->TCP Error: {}", error.display("\nCaused by: "));
         }
     });
 
@@ -70,7 +69,6 @@ async fn process_tcp2udp(
     let mut buffer = datagram_buffer();
 
     loop {
-        // Read exactly the 2-byte length header
         let result = maybe_timeout(tcp_recv_timeout, tcp_in.read_exact(&mut header_buf))
             .await
             .context("Timeout while reading from TCP")?;
@@ -82,7 +80,6 @@ async fn process_tcp2udp(
 
         let datagram_len = usize::from(u16::from_be_bytes(header_buf));
 
-        // Read exactly `datagram_len` bytes for the datagram body
         maybe_timeout(
             tcp_recv_timeout,
             tcp_in.read_exact(&mut buffer[..datagram_len]),
@@ -119,10 +116,8 @@ async fn process_udp2tcp(
     tcp_out: TcpWriteHalf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 2. Decouple Reads & Writes
-    // Create a bounded channel holding up to 1024 datagrams
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1024);
 
-    // Task A: Dedicated UDP Reader
     let udp_reader = {
         let udp_in = udp_in.clone();
         tokio::spawn(async move {
@@ -132,11 +127,9 @@ async fn process_udp2tcp(
                     Ok(n) => {
                         let datagram_len = u16::try_from(n).expect("UDP datagram too large");
                         buffer[..HEADER_LEN].copy_from_slice(&datagram_len.to_be_bytes());
-                        
                         let packet = buffer[..HEADER_LEN + n].to_vec();
                         
                         // 3. Intelligent Backpressure Handling
-                        // If the channel is full (TCP is blocking), drop the packet to prevent OS bufferbloat
                         if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(packet) {
                             log::warn!("TCP connection congested: Dropped incoming UDP datagram");
                         }
@@ -150,18 +143,19 @@ async fn process_udp2tcp(
         })
     };
 
-    // Task B: Dedicated TCP Writer
     let mut tcp_out = BufWriter::with_capacity(256 * 1024, tcp_out);
+    
+    // Read the first packet from the channel, blocking if empty
     while let Some(packet) = rx.recv().await {
         tcp_out.write_all(&packet).await.context("Failed writing to TCP")?;
-        log::trace!("Forwarded {} bytes UDP->TCP", packet.len() - HEADER_LEN);
         
-        // 4. Smart Flushing
-        // Only flush when the channel is empty to batch writes together and reduce syscalls,
-        // while maintaining immediate dispatch when traffic is light.
-        if rx.is_empty() {
-            tcp_out.flush().await.context("Failed flushing TCP")?;
+        // 4. Smart Flushing: Drain all immediately available packets before triggering a flush.
+        // This coalesces massive bursts into a single TCP packet transfer.
+        while let Ok(next_packet) = rx.try_recv() {
+            tcp_out.write_all(&next_packet).await.context("Failed writing to TCP")?;
         }
+        
+        tcp_out.flush().await.context("Failed flushing TCP")?;
     }
 
     udp_reader.abort();
