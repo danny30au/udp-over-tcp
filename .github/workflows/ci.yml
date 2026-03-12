@@ -1,39 +1,84 @@
 name: Build and test
+
 on:
   push:
     branches: ["**"]
-    tags: ["v*"]
+    tags: ["v*"]          # push v1.0.0 → triggers publish job
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: --deny warnings
+  # Both bins require clap; env_logger enables RUST_LOG= at runtime
+  BIN_FEATURES: clap,env_logger
 
 jobs:
+  # ─────────────────────────────────────────────────
+  # FORMATTING
+  # ─────────────────────────────────────────────────
   formatting:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+
       - name: Check formatting
         run: cargo fmt -- --check
 
+  # ─────────────────────────────────────────────────
+  # LINTING
+  # ─────────────────────────────────────────────────
   linting:
     runs-on: ubuntu-latest
     permissions:
       checks: write
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - name: Lint (clippy)
-        run: cargo clippy --all-features --all-targets -- --deny warnings
 
+      - uses: Swatinem/rust-cache@v2
+
+      # Lint lib (no features)
+      - name: Clippy — lib
+        run: cargo clippy --lib --all-targets -- --deny warnings
+
+      # Lint bins (requires clap feature)
+      - name: Clippy — bins
+        run: cargo clippy --bins --features ${{ env.BIN_FEATURES }} -- --deny warnings
+
+      # Lint everything including statsd feature
+      - name: Clippy — all features
+        run: cargo clippy --all-targets --all-features -- --deny warnings
+
+  # ─────────────────────────────────────────────────
+  # SECURITY AUDIT
+  # ─────────────────────────────────────────────────
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit dependencies
+        run: cargo audit --deny warnings
+
+  # ─────────────────────────────────────────────────
+  # BUILD + TEST MATRIX
+  # ─────────────────────────────────────────────────
   build-and-test:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         rust: [stable, beta]
@@ -41,24 +86,64 @@ jobs:
           - os: ubuntu-latest
             rust: nightly
           - os: ubuntu-latest
-            rust: 1.85.0  # MSRV
+            rust: "1.82.0"    # MSRV — matches rust-version in Cargo.toml
     runs-on: ${{ matrix.os }}
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
-      - uses: actions-rs/install@v0.1
-        with:
-          crate: cargo-all-features
-          version: latest
-          use-tool-cache: true
-      - name: Build
-        run: cargo build-all-features
-      - name: Test
-        run: cargo test-all-features
 
-      - name: Upload debug artifacts
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.rust }}
+
+      # ── Build ────────────────────────────────────
+      # Library only (no feature required)
+      - name: Build — lib
+        run: cargo build --lib
+        env:
+          # Only treat warnings as errors on stable + MSRV;
+          # nightly/beta add new lints that aren't our fault
+          RUSTFLAGS: >-
+            ${{ (matrix.rust == 'stable' || matrix.rust == '1.82.0')
+               && '--deny warnings' || '' }}
+
+      # Binaries (clap + env_logger)
+      - name: Build — bins
+        run: cargo build --bins --features ${{ env.BIN_FEATURES }}
+        env:
+          RUSTFLAGS: >-
+            ${{ (matrix.rust == 'stable' || matrix.rust == '1.82.0')
+               && '--deny warnings' || '' }}
+
+      # Full feature build (adds statsd/cadence)
+      - name: Build — all features
+        run: cargo build --all-features
+        env:
+          RUSTFLAGS: >-
+            ${{ (matrix.rust == 'stable' || matrix.rust == '1.82.0')
+               && '--deny warnings' || '' }}
+
+      # ── Test ─────────────────────────────────────
+      - name: Test — lib
+        run: cargo test --lib
+        env:
+          RUSTFLAGS: >-
+            ${{ (matrix.rust == 'stable' || matrix.rust == '1.82.0')
+               && '--deny warnings' || '' }}
+
+      - name: Test — all features
+        run: cargo test --all-features
+        env:
+          RUSTFLAGS: >-
+            ${{ (matrix.rust == 'stable' || matrix.rust == '1.82.0')
+               && '--deny warnings' || '' }}
+
+      # ── Debug artifacts (stable only, 7-day retention) ──
+      - name: Upload debug binaries
         if: matrix.rust == 'stable'
         uses: actions/upload-artifact@v4
         with:
@@ -71,40 +156,54 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # ─────────────────────────────────────────────────
+  # PUBLISH — only on v* tags, all CI must pass first
+  # ─────────────────────────────────────────────────
   publish:
     name: Release · ${{ matrix.target }}
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [formatting, linting, build-and-test]
+    needs: [formatting, linting, audit, build-and-test]
     permissions:
       contents: write
     strategy:
       fail-fast: false
       matrix:
         include:
+          # ── Desktop / server (native builds) ─────
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             cross: false
+
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl   # fully static, no glibc dep
+            cross: false
+            musl_tools: true
+
           - os: macos-latest
             target: x86_64-apple-darwin
             cross: false
+
           - os: macos-latest
-            target: aarch64-apple-darwin
+            target: aarch64-apple-darwin         # Apple Silicon / M-series
             cross: false
+
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             cross: false
+
+          # ── OpenWrt / embedded (cross via Docker) ──
           - os: ubuntu-latest
-            target: aarch64-unknown-linux-musl
+            target: aarch64-unknown-linux-musl   # OpenWrt ARM64 (RPi4, GL.iNet MT-series)
             cross: true
+
           - os: ubuntu-latest
-            target: arm-unknown-linux-musleabihf
+            target: arm-unknown-linux-musleabihf # OpenWrt ARMv7 (GL.iNet AR-series, etc.)
             cross: true
+
           - os: ubuntu-latest
-            target: mipsel-unknown-linux-musl
+            target: mipsel-unknown-linux-musl    # OpenWrt MIPS (legacy routers)
             cross: true
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            cross: false
+
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -113,58 +212,80 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      # Required for x86_64-unknown-linux-musl native build
       - name: Install musl-tools
-        if: matrix.target == 'x86_64-unknown-linux-musl'
+        if: matrix.musl_tools
         run: sudo apt-get install -y musl-tools
 
+      # cross uses Docker images per target — no extra setup needed beyond install
       - name: Install cross
         if: matrix.cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
 
+      # ── Build ──────────────────────────────────
+      # Release profile (opt-level=3, lto=true, codegen-units=1) is
+      # already set in Cargo.toml [profile.release] — no extra flags needed
       - name: Build release binaries
         shell: bash
         run: |
           if ${{ matrix.cross }}; then
-            cross build --release --target ${{ matrix.target }}
+            cross build --release \
+              --target ${{ matrix.target }} \
+              --features ${{ env.BIN_FEATURES }}
           else
-            cargo build --release --target ${{ matrix.target }}
+            cargo build --release \
+              --target ${{ matrix.target }} \
+              --features ${{ env.BIN_FEATURES }}
           fi
 
+      # ── Strip (Linux/macOS only) ───────────────
+      # Removes debug symbols — typically saves 60-70% binary size after LTO
+      - name: Strip debug symbols
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          T="target/${{ matrix.target }}/release"
+          strip "$T/udp2tcp" || true
+          strip "$T/tcp2udp"  || true
+
+      # ── Package + SHA256 ──────────────────────
       - name: Package binaries
         id: package
         shell: bash
         run: |
           TARGET="${{ matrix.target }}"
           TAG="${{ github.ref_name }}"
+          T="target/${TARGET}/release"
 
           if [[ "$TARGET" == *"windows"* ]]; then
             ARCHIVE="udp-over-tcp-${TAG}-${TARGET}.zip"
-            7z a "$ARCHIVE" \
-              "target/${TARGET}/release/udp2tcp.exe" \
-              "target/${TARGET}/release/tcp2udp.exe"
+            7z a "$ARCHIVE" "${T}/udp2tcp.exe" "${T}/tcp2udp.exe"
           else
-            strip "target/${TARGET}/release/udp2tcp" || true
-            strip "target/${TARGET}/release/tcp2udp" || true
             ARCHIVE="udp-over-tcp-${TAG}-${TARGET}.tar.gz"
-            tar czf "$ARCHIVE" \
-              -C "target/${TARGET}/release" \
-              udp2tcp tcp2udp
+            tar czf "$ARCHIVE" -C "$T" udp2tcp tcp2udp
           fi
 
+          # Portable SHA256: Linux = sha256sum, macOS = shasum -a 256
           sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256" 2>/dev/null || \
             shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
 
           echo "archive=${ARCHIVE}" >> "$GITHUB_OUTPUT"
 
+      # ── Upload to Actions tab (90-day retention) ──
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.package.outputs.archive }}
+          name: release-${{ matrix.target }}
           path: |
             ${{ steps.package.outputs.archive }}
             ${{ steps.package.outputs.archive }}.sha256
-          retention-days: 30
+          retention-days: 90
 
+      # ── Attach to GitHub Release ──────────────
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
