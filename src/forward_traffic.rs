@@ -1,3 +1,4 @@
+use bytes::{BufMut, Bytes, BytesMut};
 use err_context::BoxedErrorExt as _;
 use err_context::ResultExt as _;
 use socket2::Socket;
@@ -15,6 +16,7 @@ pub const MAX_DATAGRAM_SIZE: usize = u16::MAX as usize;
 pub const HEADER_LEN: usize = mem::size_of::<u16>();
 
 /// Forward traffic between the given UDP and TCP sockets in both directions.
+/// This async function runs until one of the sockets is closed or there is an error.
 pub async fn process_udp_over_tcp(
     udp_socket: UdpSocket,
     tcp_stream: TcpStream,
@@ -27,7 +29,7 @@ pub async fn process_udp_over_tcp(
     let sock = Socket::from(std_udp);
     let _ = sock.set_recv_buffer_size(4 * 1024 * 1024);
     let _ = sock.set_send_buffer_size(4 * 1024 * 1024);
-    let _ = sock.set_nonblocking(true); // Ensure it stays non-blocking
+    let _ = sock.set_nonblocking(true); // Ensure it stays non-blocking for tokio
     
     // Convert back down to std::net::UdpSocket, then to tokio::net::UdpSocket
     let std_udp: std::net::UdpSocket = sock.into();
@@ -64,6 +66,8 @@ async fn process_tcp2udp(
     udp_out: Arc<UdpSocket>,
     tcp_recv_timeout: Option<Duration>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Keep this as BufReader/read_exact. It re-uses a single allocation (datagram_buffer)
+    // for all TCP -> UDP reads, making it already zero-allocation.
     let mut tcp_in = BufReader::with_capacity(256 * 1024, tcp_in);
     let mut header_buf = [0u8; HEADER_LEN];
     let mut buffer = datagram_buffer();
@@ -115,21 +119,34 @@ async fn process_udp2tcp(
     udp_in: Arc<UdpSocket>,
     tcp_out: TcpWriteHalf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // 2. Decouple Reads & Writes
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1024);
+    // 2. Zero-Copy Bytes Channel
+    let (tx, mut rx) = mpsc::channel::<Bytes>(1024);
 
     let udp_reader = {
         let udp_in = udp_in.clone();
         tokio::spawn(async move {
-            let mut buffer = datagram_buffer();
+            let mut buf = BytesMut::with_capacity(64 * 1024);
             loop {
-                match udp_in.recv(&mut buffer[HEADER_LEN..]).await {
+                // Ensure we have enough contiguous space for a max datagram + header
+                buf.reserve(HEADER_LEN + MAX_DATAGRAM_SIZE);
+                
+                // Put a 2-byte placeholder for our length header
+                buf.put_u16(0);
+                
+                // recv_buf writes directly into the uninitialized tail of our memory block
+                match udp_in.recv_buf(&mut buf).await {
                     Ok(n) => {
                         let datagram_len = u16::try_from(n).expect("UDP datagram too large");
-                        buffer[..HEADER_LEN].copy_from_slice(&datagram_len.to_be_bytes());
-                        let packet = buffer[..HEADER_LEN + n].to_vec();
                         
-                        // 3. Intelligent Backpressure Handling
+                        // Overwrite the 2-byte placeholder at the start of our current chunk
+                        buf[0..HEADER_LEN].copy_from_slice(&datagram_len.to_be_bytes());
+                        
+                        // 3. Zero-Copy Split & Freeze
+                        // .split() takes the chunk we just wrote and leaves `buf` empty for the next loop
+                        // .freeze() safely hands a reference-counted pointer into our mpsc channel
+                        let packet = buf.split().freeze();
+                        
+                        // 4. Intelligent Backpressure Handling
                         if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(packet) {
                             log::warn!("TCP connection congested: Dropped incoming UDP datagram");
                         }
@@ -149,8 +166,8 @@ async fn process_udp2tcp(
     while let Some(packet) = rx.recv().await {
         tcp_out.write_all(&packet).await.context("Failed writing to TCP")?;
         
-        // 4. Smart Flushing: Drain all immediately available packets before triggering a flush.
-        // This coalesces massive bursts into a single TCP packet transfer.
+        // 5. Smart Latency Flushing
+        // Drain all immediately available packets before triggering a flush
         while let Ok(next_packet) = rx.try_recv() {
             tcp_out.write_all(&next_packet).await.context("Failed writing to TCP")?;
         }
