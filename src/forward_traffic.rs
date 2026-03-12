@@ -20,9 +20,16 @@ pub async fn process_udp_over_tcp(
     tcp_recv_timeout: Option<Duration>,
 ) {
     // 1. Buffer Size Improvements
-    // Increase UDP OS buffers to 4MB to absorb micro-bursts and prevent kernel-level packet drops.
-    let _ = udp_socket.set_recv_buffer_size(4 * 1024 * 1024);
-    let _ = udp_socket.set_send_buffer_size(4 * 1024 * 1024);
+    // Convert to std::net::UdpSocket to access buffer size settings
+    let std_udp = udp_socket.into_std().expect("Failed to get std socket");
+    
+    // Call the methods on `std_udp` (NOT udp_socket)
+    let _ = std_udp.set_recv_buffer_size(4 * 1024 * 1024);
+    let _ = std_udp.set_send_buffer_size(4 * 1024 * 1024);
+    let _ = std_udp.set_nonblocking(true); // Ensure it stays non-blocking for Tokio
+    
+    // Restore back to tokio::net::UdpSocket
+    let udp_socket = UdpSocket::from_std(std_udp).expect("Failed to restore tokio socket");
 
     // Disable Nagle's algorithm to reduce latency for small UDP datagrams
     tcp_stream.set_nodelay(true).expect("set_nodelay failed");
@@ -30,6 +37,9 @@ pub async fn process_udp_over_tcp(
     let udp_in = Arc::new(udp_socket);
     let udp_out = udp_in.clone();
     let (tcp_in, tcp_out) = tcp_stream.into_split();
+
+    // ... (rest of the function remains exactly the same as before)
+
 
     let mut tcp2udp_handle = tokio::spawn(async move {
         if let Err(error) = process_tcp2udp(tcp_in, udp_out, tcp_recv_timeout).await {
