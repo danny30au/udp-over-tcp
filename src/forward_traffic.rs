@@ -38,9 +38,6 @@ pub async fn process_udp_over_tcp(
     let udp_out = udp_in.clone();
     let (tcp_in, tcp_out) = tcp_stream.into_split();
 
-    // ... (rest of the function remains exactly the same as before)
-
-
     let mut tcp2udp_handle = tokio::spawn(async move {
         if let Err(error) = process_tcp2udp(tcp_in, udp_out, tcp_recv_timeout).await {
             log::error!("TCP->UDP Error: {}", error.display("
