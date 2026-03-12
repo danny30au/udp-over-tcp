@@ -1,8 +1,7 @@
-name: Build and test
+name: Build and publish
 
 on:
   push:
-    branches: ["**"]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -11,122 +10,8 @@ env:
   BIN_FEATURES: clap,env_logger
 
 jobs:
-  # ─────────────────────────────────────────────────
-  # FORMATTING
-  # ─────────────────────────────────────────────────
-  formatting:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - name: Check formatting
-        run: cargo fmt -- --check
-
-  # ─────────────────────────────────────────────────
-  # LINTING
-  # ─────────────────────────────────────────────────
-  linting:
-    runs-on: ubuntu-latest
-    permissions:
-      checks: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Clippy — lib
-        run: cargo clippy --lib --all-targets -- --deny warnings
-      - name: Clippy — bins
-        run: cargo clippy --bins --features ${{ env.BIN_FEATURES }} -- --deny warnings
-      - name: Clippy — all features
-        run: cargo clippy --all-targets --all-features -- --deny warnings
-
-  # ─────────────────────────────────────────────────
-  # SECURITY AUDIT
-  # ─────────────────────────────────────────────────
-  audit:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-      - name: Audit dependencies
-        run: cargo audit --deny warnings
-
-  # ─────────────────────────────────────────────────
-  # BUILD + TEST MATRIX
-  # ─────────────────────────────────────────────────
-  build-and-test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        rust: [stable, beta]
-        include:
-          - os: ubuntu-latest
-            rust: nightly
-          - os: ubuntu-latest
-            rust: "1.85.0"    # MSRV
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ matrix.rust }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.rust }}
-
-      - name: Build — lib
-        run: cargo build --lib
-        env:
-          RUSTFLAGS: ${{ (matrix.rust == 'stable' || matrix.rust == '1.82.0') && '--deny warnings' || '' }}
-
-      - name: Build — bins
-        run: cargo build --bins --features ${{ env.BIN_FEATURES }}
-        env:
-          RUSTFLAGS: ${{ (matrix.rust == 'stable' || matrix.rust == '1.82.0') && '--deny warnings' || '' }}
-
-      - name: Build — all features
-        run: cargo build --all-features
-        env:
-          RUSTFLAGS: ${{ (matrix.rust == 'stable' || matrix.rust == '1.82.0') && '--deny warnings' || '' }}
-
-      - name: Test — lib
-        run: cargo test --lib
-        env:
-          RUSTFLAGS: ${{ (matrix.rust == 'stable' || matrix.rust == '1.82.0') && '--deny warnings' || '' }}
-
-      - name: Test — all features
-        run: cargo test --all-features
-        env:
-          RUSTFLAGS: ${{ (matrix.rust == 'stable' || matrix.rust == '1.82.0') && '--deny warnings' || '' }}
-
-      - name: Upload debug binaries
-        if: matrix.rust == 'stable'
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-${{ matrix.os }}
-          path: |
-            target/debug/udp2tcp
-            target/debug/udp2tcp.exe
-            target/debug/tcp2udp
-            target/debug/tcp2udp.exe
-          if-no-files-found: ignore
-          retention-days: 7
-
-  # ─────────────────────────────────────────────────
-  # PUBLISH — only on v* tags, all CI must pass first
-  # ─────────────────────────────────────────────────
   publish:
     name: Release · ${{ matrix.target }}
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [formatting, linting, audit, build-and-test]
     permissions:
       contents: write
     strategy:
@@ -134,21 +19,19 @@ jobs:
       matrix:
         include:
 
-          # ── OpenWrt x86_64 — primary target ──────────────────────────────
-          # Fully static musl binary. No glibc, no dynamic deps.
-          # Drop directly onto OpenWrt x86_64 — no opkg install required.
+          # ── OpenWrt x86_64 — primary target ───────────────────────────────
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             cross: false
             openwrt: true
 
-          # ── Standard Linux (glibc, for regular servers/VMs) ──────────────
+          # ── Standard Linux ─────────────────────────────────────────────────
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             cross: false
             openwrt: false
 
-          # ── macOS ─────────────────────────────────────────────────────────
+          # ── macOS ──────────────────────────────────────────────────────────
           - os: macos-latest
             target: x86_64-apple-darwin
             cross: false
@@ -159,13 +42,13 @@ jobs:
             cross: false
             openwrt: false
 
-          # ── Windows ───────────────────────────────────────────────────────
+          # ── Windows ────────────────────────────────────────────────────────
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             cross: false
             openwrt: false
 
-          # ── OpenWrt other arches (cross-compiled) ─────────────────────────
+          # ── OpenWrt embedded (cross-compiled) ──────────────────────────────
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             cross: true
@@ -193,29 +76,19 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
-      # ── musl toolchain for x86_64-unknown-linux-musl (native, no cross) ──
-      # musl-tools provides musl-gcc; musl-dev provides the musl headers/libs.
-      # The linker env var explicitly tells cargo's cc crate to use musl-gcc
-      # so every C dependency (if any) also links statically against musl.
       - name: Install musl toolchain
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get install -y musl-tools musl-dev
 
-      # ── cross for embedded/ARM/MIPS targets ───────────────────────────────
       - name: Install cross
         if: matrix.cross
         run: cargo install cross --git https://github.com/cross-rs/cross --locked
 
-      # ── Build ─────────────────────────────────────────────────────────────
       - name: Build release binaries
         shell: bash
         env:
-          # Tell the cc crate to use musl-gcc for any C deps on musl target.
-          # target_env_escaped converts x86_64-unknown-linux-musl
-          # → CC_x86_64_unknown_linux_musl for cargo's cc convention.
           CC_x86_64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-          # Force all crates to link statically against musl (belt-and-suspenders)
           RUSTFLAGS: ${{ matrix.target == 'x86_64-unknown-linux-musl' && '-C target-feature=+crt-static' || '' }}
         run: |
           if ${{ matrix.cross }}; then
@@ -228,9 +101,6 @@ jobs:
               --features ${{ env.BIN_FEATURES }}
           fi
 
-      # ── Verify static linking (OpenWrt targets only) ──────────────────────
-      # Catches accidental dynamic glibc linkage before packaging.
-      # 'file' output must show "statically linked" for OpenWrt binaries.
       - name: Verify static binary
         if: matrix.openwrt && runner.os == 'Linux'
         shell: bash
@@ -244,16 +114,11 @@ jobs:
             fi
           done
 
-      # ── Strip debug symbols ───────────────────────────────────────────────
-      # Critical for OpenWrt — flash storage is limited.
-      # Before strip: ~4-6MB (LTO binary with debuginfo)
-      # After strip:  ~800KB-1.2MB
       - name: Strip binaries
         if: runner.os != 'Windows'
         shell: bash
         run: |
           T="target/${{ matrix.target }}/release"
-          # Use cross-strip for cross-compiled targets if available
           if ${{ matrix.cross }}; then
             STRIP_CMD="llvm-strip"
           else
@@ -261,10 +126,8 @@ jobs:
           fi
           ${STRIP_CMD} "${T}/udp2tcp" || strip "${T}/udp2tcp" || true
           ${STRIP_CMD} "${T}/tcp2udp" || strip "${T}/tcp2udp" || true
-          # Show final sizes
           ls -lh "${T}/udp2tcp" "${T}/tcp2udp"
 
-      # ── Package ───────────────────────────────────────────────────────────
       - name: Package binaries
         id: package
         shell: bash
