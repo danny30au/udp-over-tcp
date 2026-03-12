@@ -1,3 +1,4 @@
+use socket2::Socket;
 use err_context::BoxedErrorExt as _;
 use err_context::ResultExt as _;
 use std::io;
