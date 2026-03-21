@@ -1,0 +1,5 @@
+# In Cargo.toml [dependencies], replace any existing socket2 line with:
+socket2 = { version = "0.5", features = ["all"] }
+
+# The "all" feature enables set_reuse_port on both Socket and SockRef on Unix,
+# and set_nodelay (TCP_NODELAY) on SockRef. Without it these methods are absent.
