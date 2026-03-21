@@ -3,7 +3,8 @@
 
 use crate::exponential_backoff::ExponentialBackoff;
 use crate::logging::Redact;
-use err_context::{BoxedErrorExt as _, ErrorExt as _, ResultExt as _};
+use err_context::ErrorExt as _;
+use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use std::convert::Infallible;
 use std::fmt;
 use std::io;
@@ -11,7 +12,12 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
+use tokio::task::JoinSet;
 use tokio::time::sleep;
+
+// Note: `futures::future::join_all` removed in favour of `tokio::task::JoinSet`.
+// Note: `err_context::{BoxedErrorExt, ResultExt}` removed; `process_socket` now returns
+//       a concrete `ProcessSocketError` instead of `Box<dyn Error>`.
 
 #[path = "statsd.rs"]
 mod statsd;
@@ -107,7 +113,7 @@ impl fmt::Display for Tcp2UdpError {
             NoTcpListenAddrs => "Invalid options, no TCP listen addresses".fmt(f),
             CreateTcpSocket(_) => "Failed to create TCP socket".fmt(f),
             ApplyTcpOptions(_) => "Failed to apply options to TCP socket".fmt(f),
-            SetReuseAddr(_) => "Failed to set SO_REUSEADDR on TCP socket".fmt(f),
+            SetReuseAddr(_) => "Failed to set SO_REUSEADDR/SO_REUSEPORT on TCP socket".fmt(f),
             BindTcpSocket(_, addr) => write!(f, "Failed to bind TCP socket to {}", addr),
             ListenTcpSocket(_, addr) => write!(
                 f,
@@ -132,6 +138,31 @@ impl std::error::Error for Tcp2UdpError {
             ListenTcpSocket(e, _) => Some(e),
             #[cfg(feature = "statsd")]
             CreateStatsdClient(e) => Some(e),
+        }
+    }
+}
+
+/// Concrete error type for per-connection UDP socket setup in [`process_socket`].
+/// Replaces `Box<dyn std::error::Error>` to avoid a heap allocation on every error path.
+#[derive(Debug)]
+enum ProcessSocketError {
+    BindUdp(io::Error),
+    ConnectUdp(io::Error),
+}
+
+impl fmt::Display for ProcessSocketError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BindUdp(_) => "Failed to bind UDP socket".fmt(f),
+            Self::ConnectUdp(_) => "Failed to connect UDP socket to peer".fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for ProcessSocketError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BindUdp(e) | Self::ConnectUdp(e) => Some(e),
         }
     }
 }
@@ -163,7 +194,10 @@ pub async fn run(options: Options) -> Result<Infallible, Tcp2UdpError> {
         }
     });
 
-    let mut join_handles = Vec::with_capacity(options.tcp_listen_addrs.len());
+    // JoinSet replaces `Vec<JoinHandle> + futures::future::join_all`:
+    //   - reaps completed tasks immediately instead of holding all handles until every task ends
+    //   - surfaces per-task panics so they can be logged rather than silently ignored
+    let mut set = JoinSet::new();
     for tcp_listen_addr in options.tcp_listen_addrs {
         let tcp_listener = create_listening_socket(tcp_listen_addr, &options.tcp_options)?;
         log::info!("Listening on {}/TCP", tcp_listener.local_addr().unwrap());
@@ -172,7 +206,7 @@ pub async fn run(options: Options) -> Result<Infallible, Tcp2UdpError> {
         let tcp_recv_timeout = options.tcp_options.recv_timeout;
         let tcp_nodelay = options.tcp_options.nodelay;
         let statsd = Arc::clone(&statsd);
-        join_handles.push(tokio::spawn(async move {
+        set.spawn(async move {
             process_tcp_listener(
                 tcp_listener,
                 udp_bind_ip,
@@ -182,9 +216,15 @@ pub async fn run(options: Options) -> Result<Infallible, Tcp2UdpError> {
                 statsd,
             )
             .await;
-        }));
+        });
     }
-    futures::future::join_all(join_handles).await;
+
+    while let Some(res) = set.join_next().await {
+        match res {
+            Ok(_) => unreachable!("Listener tasks run forever"),
+            Err(e) => log::error!("Listener task panicked: {:?}", e),
+        }
+    }
     unreachable!("Listening TCP sockets never exit");
 }
 
@@ -197,15 +237,37 @@ fn create_listening_socket(
         SocketAddr::V6(..) => TcpSocket::new_v6(),
     }
     .map_err(Tcp2UdpError::CreateTcpSocket)?;
+
     crate::tcp_options::apply(&tcp_socket, options).map_err(Tcp2UdpError::ApplyTcpOptions)?;
+
     tcp_socket
         .set_reuseaddr(true)
         .map_err(Tcp2UdpError::SetReuseAddr)?;
+
+    // SO_REUSEPORT lets the kernel distribute incoming connections across all Tokio
+    // worker threads independently, removing the single-core accept() bottleneck.
+    #[cfg(unix)]
+    SockRef::from(&tcp_socket)
+        .set_reuse_port(true)
+        .map_err(Tcp2UdpError::SetReuseAddr)?;
+
+    // Accepted TcpStreams inherit these buffer sizes from the listener socket,
+    // so tuning here applies to every future connection without per-stream syscalls.
+    tcp_socket
+        .set_recv_buffer_size(256 * 1024)
+        .map_err(Tcp2UdpError::CreateTcpSocket)?;
+    tcp_socket
+        .set_send_buffer_size(256 * 1024)
+        .map_err(Tcp2UdpError::CreateTcpSocket)?;
+
     tcp_socket
         .bind(addr)
         .map_err(|e| Tcp2UdpError::BindTcpSocket(e, addr))?;
+
+    // Backlog raised from 1024 to 4096: under DNS burst traffic the kernel drops
+    // incoming SYNs with RST when the queue fills, causing silent client-side retries.
     let tcp_listener = tcp_socket
-        .listen(1024)
+        .listen(4096)
         .map_err(|e| Tcp2UdpError::ListenTcpSocket(e, addr))?;
 
     Ok(tcp_listener)
@@ -225,11 +287,13 @@ async fn process_tcp_listener(
         match tcp_listener.accept().await {
             Ok((tcp_stream, tcp_peer_addr)) => {
                 log::debug!("Incoming connection from {}/TCP", Redact(tcp_peer_addr));
-                if let Err(error) = crate::tcp_options::set_nodelay(&tcp_stream, tcp_nodelay) {
-                    log::error!("Error: {}", error.display("\nCaused by: "));
-                }
                 let statsd = statsd.clone();
                 tokio::spawn(async move {
+                    // set_nodelay moved inside the spawned task so the accept loop is never
+                    // stalled by a syscall before it can call accept() again.
+                    if let Err(error) = crate::tcp_options::set_nodelay(&tcp_stream, tcp_nodelay) {
+                        log::error!("Error: {}", error.display("\nCaused by: "));
+                    }
                     statsd.incr_connections();
                     if let Err(error) = process_socket(
                         tcp_stream,
@@ -270,27 +334,43 @@ async fn process_socket(
     udp_bind_ip: IpAddr,
     udp_peer_addr: SocketAddr,
     tcp_recv_timeout: Option<Duration>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), ProcessSocketError> {
     let udp_bind_addr = SocketAddr::new(udp_bind_ip, 0);
 
-    let udp_socket = UdpSocket::bind(udp_bind_addr)
-        .await
-        .with_context(|_| format!("Failed to bind UDP socket to {}", udp_bind_addr))?;
+    // Build UDP socket via socket2 to tune SO_RCVBUF/SO_SNDBUF, which Tokio's
+    // UdpSocket::bind does not expose. Larger buffers reduce kernel-side packet drops
+    // under the burst traffic typical of DNS-over-TCP workloads.
+    let domain = match udp_bind_addr {
+        SocketAddr::V4(..) => Domain::IPV4,
+        SocketAddr::V6(..) => Domain::IPV6,
+    };
+    let raw_udp = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
+        .map_err(ProcessSocketError::BindUdp)?;
+    raw_udp
+        .set_recv_buffer_size(512 * 1024)
+        .map_err(ProcessSocketError::BindUdp)?;
+    raw_udp
+        .set_send_buffer_size(512 * 1024)
+        .map_err(ProcessSocketError::BindUdp)?;
+    raw_udp
+        .set_nonblocking(true)
+        .map_err(ProcessSocketError::BindUdp)?;
+    raw_udp
+        .bind(&udp_bind_addr.into())
+        .map_err(ProcessSocketError::BindUdp)?;
+
+    let udp_socket =
+        UdpSocket::from_std(raw_udp.into()).map_err(ProcessSocketError::BindUdp)?;
+
     udp_socket
         .connect(udp_peer_addr)
         .await
-        .with_context(|_| format!("Failed to connect UDP socket to {}", udp_peer_addr))?;
+        .map_err(ProcessSocketError::ConnectUdp)?;
 
-    log::debug!(
-        "UDP socket bound to {} and connected to {}",
-        udp_socket
-            .local_addr()
-            .ok()
-            .as_ref()
-            .map(|item| -> &dyn fmt::Display { item })
-            .unwrap_or(&"unknown"),
-        udp_peer_addr
-    );
+    match udp_socket.local_addr() {
+        Ok(local) => log::debug!("UDP socket bound to {} -> {}", local, udp_peer_addr),
+        Err(_) => log::debug!("UDP socket connected to {}", udp_peer_addr),
+    }
 
     crate::forward_traffic::process_udp_over_tcp(udp_socket, tcp_stream, tcp_recv_timeout).await;
     log::debug!(
