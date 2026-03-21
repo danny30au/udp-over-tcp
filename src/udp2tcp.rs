@@ -2,6 +2,7 @@
 //! to a TCP stream.
 
 use crate::logging::Redact;
+use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
@@ -71,17 +72,61 @@ impl Udp2Tcp {
         tcp_forward_addr: SocketAddr,
         tcp_options: crate::TcpOptions,
     ) -> Result<Self, Error> {
+        // --- TCP socket setup ---
         let tcp_socket = match &tcp_forward_addr {
             SocketAddr::V4(..) => TcpSocket::new_v4(),
             SocketAddr::V6(..) => TcpSocket::new_v6(),
         }
         .map_err(Error::CreateTcpSocket)?;
 
+        // Apply user-defined TCP options (keepalive, etc.) before connecting.
         crate::tcp_options::apply(&tcp_socket, &tcp_options).map_err(Error::ApplyTcpOptions)?;
 
-        let udp_socket = UdpSocket::bind(udp_listen_addr)
-            .await
+        // Set TCP_NODELAY on the pre-connect socket via socket2 so the very first
+        // segment after the handshake is sent without Nagle delay.
+        if tcp_options.nodelay {
+            SockRef::from(&tcp_socket)
+                .set_tcp_nodelay(true)
+                .map_err(Error::CreateTcpSocket)?;
+        }
+
+        // Increase TCP socket buffers beyond OS defaults for higher throughput.
+        tcp_socket
+            .set_recv_buffer_size(256 * 1024)
+            .map_err(Error::CreateTcpSocket)?;
+        tcp_socket
+            .set_send_buffer_size(256 * 1024)
+            .map_err(Error::CreateTcpSocket)?;
+
+        // --- UDP socket setup via socket2 for SO_REUSEPORT and buffer tuning ---
+        let domain = match &udp_listen_addr {
+            SocketAddr::V4(..) => Domain::IPV4,
+            SocketAddr::V6(..) => Domain::IPV6,
+        };
+        let raw_udp =
+            Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).map_err(Error::BindUdp)?;
+
+        raw_udp.set_reuse_address(true).map_err(Error::BindUdp)?;
+        // SO_REUSEPORT allows multiple tasks to share the socket fd, enabling
+        // concurrent datagram dispatch across Tokio worker threads.
+        #[cfg(unix)]
+        raw_udp.set_reuse_port(true).map_err(Error::BindUdp)?;
+
+        // Larger UDP buffers reduce kernel-side packet drops under burst traffic.
+        raw_udp
+            .set_recv_buffer_size(512 * 1024)
             .map_err(Error::BindUdp)?;
+        raw_udp
+            .set_send_buffer_size(512 * 1024)
+            .map_err(Error::BindUdp)?;
+
+        raw_udp.set_nonblocking(true).map_err(Error::BindUdp)?;
+        raw_udp
+            .bind(&udp_listen_addr.into())
+            .map_err(Error::BindUdp)?;
+
+        let udp_socket = UdpSocket::from_std(raw_udp.into()).map_err(Error::BindUdp)?;
+
         match udp_socket.local_addr() {
             Ok(addr) => log::info!("Listening on {}/UDP", addr),
             Err(e) => log::error!("Unable to get UDP local addr: {}", e),
@@ -112,43 +157,58 @@ impl Udp2Tcp {
     /// Connects to the TCP address and runs the forwarding until the TCP socket is closed, or
     /// an error occur.
     pub async fn run(self) -> Result<(), Error> {
-        // Wait for the first datagram, to get the UDP peer_addr to connect to.
+        let Self {
+            tcp_socket,
+            udp_socket,
+            tcp_forward_addr,
+            tcp_options,
+        } = self;
+
         let mut tmp_buffer = crate::forward_traffic::datagram_buffer();
-        let (_udp_read_len, udp_peer_addr) = self
-            .udp_socket
-            .peek_from(tmp_buffer.as_mut())
-            .await
-            .map_err(Error::ReadUdp)?;
-        log::info!("Incoming connection from {}/UDP", Redact(udp_peer_addr));
 
-        log::info!("Connecting to {}/TCP", self.tcp_forward_addr);
-        let tcp_stream = self
-            .tcp_socket
-            .connect(self.tcp_forward_addr)
-            .await
-            .map_err(Error::ConnectTcp)?;
-        log::info!("Connected to {}/TCP", self.tcp_forward_addr);
+        // Concurrently wait for the first UDP datagram AND establish the TCP connection.
+        // Previously these were sequential: peek_from (syscall #1) -> TCP connect -> re-read
+        // (syscall #2 inside process_udp_over_tcp). Now we do both in parallel with a single
+        // real recv_from, saving one full TCP RTT and one redundant syscall per session.
+        log::debug!("Connecting to {}/TCP", tcp_forward_addr);
+        let (tcp_result, udp_result) = tokio::join!(
+            tcp_socket.connect(tcp_forward_addr),
+            udp_socket.recv_from(tmp_buffer.as_mut())
+        );
 
-        crate::tcp_options::set_nodelay(&tcp_stream, self.tcp_options.nodelay)
+        let tcp_stream = tcp_result.map_err(Error::ConnectTcp)?;
+        let (first_datagram_len, udp_peer_addr) = udp_result.map_err(Error::ReadUdp)?;
+
+        log::debug!("Incoming connection from {}/UDP", Redact(udp_peer_addr));
+        log::debug!("Connected to {}/TCP", tcp_forward_addr);
+
+        // Belt-and-suspenders: also set TCP_NODELAY on the live TcpStream in case the
+        // pre-connect SockRef call was not honoured by the OS.
+        crate::tcp_options::set_nodelay(&tcp_stream, tcp_options.nodelay)
             .map_err(Error::ApplyTcpOptions)?;
 
-        // Connect the UDP socket to whoever sent the first datagram. This is where
-        // all the returned traffic will be sent to.
-        self.udp_socket
+        // Connect the UDP socket to whoever sent the first datagram. All return
+        // traffic will be directed back to this peer.
+        udp_socket
             .connect(udp_peer_addr)
             .await
             .map_err(Error::ConnectUdp)?;
 
+        // Pass the already-read first datagram directly so process_udp_over_tcp does not
+        // need to re-read it. Requires the updated signature:
+        //   process_udp_over_tcp(udp, tcp, timeout, first_datagram: Option<&[u8]>)
         crate::forward_traffic::process_udp_over_tcp(
-            self.udp_socket,
+            udp_socket,
             tcp_stream,
-            self.tcp_options.recv_timeout,
+            tcp_options.recv_timeout,
+            Some(&tmp_buffer[..first_datagram_len]),
         )
         .await;
+
         log::debug!(
             "Closing forwarding for {}/UDP <-> {}/TCP",
             Redact(udp_peer_addr),
-            self.tcp_forward_addr,
+            tcp_forward_addr,
         );
 
         Ok(())
