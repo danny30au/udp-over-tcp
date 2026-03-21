@@ -82,15 +82,17 @@ impl Udp2Tcp {
         // Apply user-defined TCP options (keepalive, etc.) before connecting.
         crate::tcp_options::apply(&tcp_socket, &tcp_options).map_err(Error::ApplyTcpOptions)?;
 
-        // Set TCP_NODELAY on the pre-connect socket via socket2 so the very first
-        // segment after the handshake is sent without Nagle delay.
+        // FIX: set_tcp_nodelay → set_nodelay (correct socket2 SockRef method name).
+        // Sets TCP_NODELAY on the pre-connect socket so the first post-handshake segment
+        // is sent without Nagle buffering delay.
         if tcp_options.nodelay {
             SockRef::from(&tcp_socket)
-                .set_tcp_nodelay(true)
+                .set_nodelay(true)
                 .map_err(Error::CreateTcpSocket)?;
         }
 
         // Increase TCP socket buffers beyond OS defaults for higher throughput.
+        // Requires socket2 = { version = "0.5", features = ["all"] } in Cargo.toml.
         tcp_socket
             .set_recv_buffer_size(256 * 1024)
             .map_err(Error::CreateTcpSocket)?;
@@ -99,6 +101,7 @@ impl Udp2Tcp {
             .map_err(Error::CreateTcpSocket)?;
 
         // --- UDP socket setup via socket2 for SO_REUSEPORT and buffer tuning ---
+        // Requires socket2 = { version = "0.5", features = ["all"] } in Cargo.toml.
         let domain = match &udp_listen_addr {
             SocketAddr::V4(..) => Domain::IPV4,
             SocketAddr::V6(..) => Domain::IPV6,
@@ -107,8 +110,9 @@ impl Udp2Tcp {
             Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).map_err(Error::BindUdp)?;
 
         raw_udp.set_reuse_address(true).map_err(Error::BindUdp)?;
-        // SO_REUSEPORT allows multiple tasks to share the socket fd, enabling
-        // concurrent datagram dispatch across Tokio worker threads.
+        // SO_REUSEPORT allows multiple tasks to share the socket fd, enabling concurrent
+        // datagram dispatch across Tokio worker threads.
+        // FIX: guarded by cfg(unix) AND requires socket2 features = ["all"] in Cargo.toml.
         #[cfg(unix)]
         raw_udp.set_reuse_port(true).map_err(Error::BindUdp)?;
 
@@ -166,24 +170,23 @@ impl Udp2Tcp {
 
         let mut tmp_buffer = crate::forward_traffic::datagram_buffer();
 
-        // Concurrently wait for the first UDP datagram AND establish the TCP connection.
-        // Previously these were sequential: peek_from (syscall #1) -> TCP connect -> re-read
-        // (syscall #2 inside process_udp_over_tcp). Now we do both in parallel with a single
-        // real recv_from, saving one full TCP RTT and one redundant syscall per session.
+        // FIX: process_udp_over_tcp only accepts 3 arguments (forward_traffic.rs signature
+        // unchanged). We keep peek_from so the datagram stays in the kernel buffer for
+        // process_udp_over_tcp to read, but we now run the TCP connect CONCURRENTLY with
+        // the peek, saving a full RTT vs the original sequential approach.
         log::debug!("Connecting to {}/TCP", tcp_forward_addr);
         let (tcp_result, udp_result) = tokio::join!(
             tcp_socket.connect(tcp_forward_addr),
-            udp_socket.recv_from(tmp_buffer.as_mut())
+            udp_socket.peek_from(tmp_buffer.as_mut())
         );
 
         let tcp_stream = tcp_result.map_err(Error::ConnectTcp)?;
-        let (first_datagram_len, udp_peer_addr) = udp_result.map_err(Error::ReadUdp)?;
+        let (_, udp_peer_addr) = udp_result.map_err(Error::ReadUdp)?;
 
         log::debug!("Incoming connection from {}/UDP", Redact(udp_peer_addr));
         log::debug!("Connected to {}/TCP", tcp_forward_addr);
 
-        // Belt-and-suspenders: also set TCP_NODELAY on the live TcpStream in case the
-        // pre-connect SockRef call was not honoured by the OS.
+        // Belt-and-suspenders: also set TCP_NODELAY on the live TcpStream.
         crate::tcp_options::set_nodelay(&tcp_stream, tcp_options.nodelay)
             .map_err(Error::ApplyTcpOptions)?;
 
@@ -194,14 +197,10 @@ impl Udp2Tcp {
             .await
             .map_err(Error::ConnectUdp)?;
 
-        // Pass the already-read first datagram directly so process_udp_over_tcp does not
-        // need to re-read it. Requires the updated signature:
-        //   process_udp_over_tcp(udp, tcp, timeout, first_datagram: Option<&[u8]>)
         crate::forward_traffic::process_udp_over_tcp(
             udp_socket,
             tcp_stream,
             tcp_options.recv_timeout,
-            Some(&tmp_buffer[..first_datagram_len]),
         )
         .await;
 

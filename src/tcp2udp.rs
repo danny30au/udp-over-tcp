@@ -95,7 +95,7 @@ pub enum Tcp2UdpError {
     CreateTcpSocket(io::Error),
     /// Failed to apply TCP options to socket.
     ApplyTcpOptions(crate::tcp_options::ApplyTcpOptionsError),
-    /// Failed to enable `SO_REUSEADDR` on TCP socket
+    /// Failed to enable `SO_REUSEADDR`/`SO_REUSEPORT` on TCP socket.
     SetReuseAddr(io::Error),
     /// Failed to bind TCP socket to SocketAddr
     BindTcpSocket(io::Error, SocketAddr),
@@ -196,7 +196,7 @@ pub async fn run(options: Options) -> Result<Infallible, Tcp2UdpError> {
 
     // JoinSet replaces `Vec<JoinHandle> + futures::future::join_all`:
     //   - reaps completed tasks immediately instead of holding all handles until every task ends
-    //   - surfaces per-task panics so they can be logged rather than silently ignored
+    //   - surfaces per-task panics individually so they can be logged rather than silently dropped
     let mut set = JoinSet::new();
     for tcp_listen_addr in options.tcp_listen_addrs {
         let tcp_listener = create_listening_socket(tcp_listen_addr, &options.tcp_options)?;
@@ -244,15 +244,16 @@ fn create_listening_socket(
         .set_reuseaddr(true)
         .map_err(Tcp2UdpError::SetReuseAddr)?;
 
-    // SO_REUSEPORT lets the kernel distribute incoming connections across all Tokio
-    // worker threads independently, removing the single-core accept() bottleneck.
+    // SO_REUSEPORT lets the kernel distribute incoming connections across all Tokio worker
+    // threads independently, removing the single-core accept() bottleneck.
+    // FIX: requires socket2 = { version = "0.5", features = ["all"] } in Cargo.toml.
     #[cfg(unix)]
     SockRef::from(&tcp_socket)
         .set_reuse_port(true)
         .map_err(Tcp2UdpError::SetReuseAddr)?;
 
-    // Accepted TcpStreams inherit these buffer sizes from the listener socket,
-    // so tuning here applies to every future connection without per-stream syscalls.
+    // Accepted TcpStreams inherit buffer sizes from the listener socket, so tuning here
+    // applies to every future connection without per-stream syscalls.
     tcp_socket
         .set_recv_buffer_size(256 * 1024)
         .map_err(Tcp2UdpError::CreateTcpSocket)?;
@@ -264,8 +265,8 @@ fn create_listening_socket(
         .bind(addr)
         .map_err(|e| Tcp2UdpError::BindTcpSocket(e, addr))?;
 
-    // Backlog raised from 1024 to 4096: under DNS burst traffic the kernel drops
-    // incoming SYNs with RST when the queue fills, causing silent client-side retries.
+    // Backlog raised from 1024 to 4096: under DNS burst traffic the kernel silently drops
+    // incoming SYNs with RST when the queue fills, causing client-side retries.
     let tcp_listener = tcp_socket
         .listen(4096)
         .map_err(|e| Tcp2UdpError::ListenTcpSocket(e, addr))?;
@@ -340,6 +341,7 @@ async fn process_socket(
     // Build UDP socket via socket2 to tune SO_RCVBUF/SO_SNDBUF, which Tokio's
     // UdpSocket::bind does not expose. Larger buffers reduce kernel-side packet drops
     // under the burst traffic typical of DNS-over-TCP workloads.
+    // FIX: requires socket2 = { version = "0.5", features = ["all"] } in Cargo.toml.
     let domain = match udp_bind_addr {
         SocketAddr::V4(..) => Domain::IPV4,
         SocketAddr::V6(..) => Domain::IPV6,
