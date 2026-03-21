@@ -4,7 +4,7 @@
 use crate::exponential_backoff::ExponentialBackoff;
 use crate::logging::Redact;
 use err_context::ErrorExt as _;
-use socket2::{Domain, Protocol, SockRef, Socket, Type};
+use socket2::{Domain, Protocol, Socket, Type};
 use std::convert::Infallible;
 use std::fmt;
 use std::io;
@@ -18,6 +18,8 @@ use tokio::time::sleep;
 // Note: `futures::future::join_all` removed in favour of `tokio::task::JoinSet`.
 // Note: `err_context::{BoxedErrorExt, ResultExt}` removed; `process_socket` now returns
 //       a concrete `ProcessSocketError` instead of `Box<dyn Error>`.
+// Note: `socket2::SockRef` removed from imports — set_reuse_port is commented out pending
+//       `socket2 = { version = "0.5", features = ["all"] }` in Cargo.toml (see below).
 
 #[path = "statsd.rs"]
 mod statsd;
@@ -95,7 +97,7 @@ pub enum Tcp2UdpError {
     CreateTcpSocket(io::Error),
     /// Failed to apply TCP options to socket.
     ApplyTcpOptions(crate::tcp_options::ApplyTcpOptionsError),
-    /// Failed to enable `SO_REUSEADDR`/`SO_REUSEPORT` on TCP socket.
+    /// Failed to enable `SO_REUSEADDR` on TCP socket.
     SetReuseAddr(io::Error),
     /// Failed to bind TCP socket to SocketAddr
     BindTcpSocket(io::Error, SocketAddr),
@@ -113,7 +115,7 @@ impl fmt::Display for Tcp2UdpError {
             NoTcpListenAddrs => "Invalid options, no TCP listen addresses".fmt(f),
             CreateTcpSocket(_) => "Failed to create TCP socket".fmt(f),
             ApplyTcpOptions(_) => "Failed to apply options to TCP socket".fmt(f),
-            SetReuseAddr(_) => "Failed to set SO_REUSEADDR/SO_REUSEPORT on TCP socket".fmt(f),
+            SetReuseAddr(_) => "Failed to set SO_REUSEADDR on TCP socket".fmt(f),
             BindTcpSocket(_, addr) => write!(f, "Failed to bind TCP socket to {}", addr),
             ListenTcpSocket(_, addr) => write!(
                 f,
@@ -244,16 +246,18 @@ fn create_listening_socket(
         .set_reuseaddr(true)
         .map_err(Tcp2UdpError::SetReuseAddr)?;
 
-    // SO_REUSEPORT lets the kernel distribute incoming connections across all Tokio worker
-    // threads independently, removing the single-core accept() bottleneck.
-    // FIX: requires socket2 = { version = "0.5", features = ["all"] } in Cargo.toml.
-    #[cfg(unix)]
-    SockRef::from(&tcp_socket)
-        .set_reuse_port(true)
-        .map_err(Tcp2UdpError::SetReuseAddr)?;
+    // TO ENABLE SO_REUSEPORT (lets the kernel distribute connections across all Tokio
+    // worker threads, removing the single-core accept bottleneck): add
+    // `socket2 = { version = "0.5", features = ["all"] }` to Cargo.toml, add
+    // `use socket2::SockRef;` to the imports, then uncomment the following block:
+    //
+    // #[cfg(unix)]
+    // SockRef::from(&tcp_socket)
+    //     .set_reuse_port(true)
+    //     .map_err(Tcp2UdpError::SetReuseAddr)?;
 
     // Accepted TcpStreams inherit buffer sizes from the listener socket, so tuning here
-    // applies to every future connection without per-stream syscalls.
+    // covers every future connection without per-stream syscalls.
     tcp_socket
         .set_recv_buffer_size(256 * 1024)
         .map_err(Tcp2UdpError::CreateTcpSocket)?;
@@ -265,8 +269,8 @@ fn create_listening_socket(
         .bind(addr)
         .map_err(|e| Tcp2UdpError::BindTcpSocket(e, addr))?;
 
-    // Backlog raised from 1024 to 4096: under DNS burst traffic the kernel silently drops
-    // incoming SYNs with RST when the queue fills, causing client-side retries.
+    // Backlog raised from 1024 to 4096: under DNS burst traffic the kernel silently
+    // drops incoming SYNs with RST when the queue fills, causing client-side retries.
     let tcp_listener = tcp_socket
         .listen(4096)
         .map_err(|e| Tcp2UdpError::ListenTcpSocket(e, addr))?;
@@ -290,7 +294,7 @@ async fn process_tcp_listener(
                 log::debug!("Incoming connection from {}/TCP", Redact(tcp_peer_addr));
                 let statsd = statsd.clone();
                 tokio::spawn(async move {
-                    // set_nodelay moved inside the spawned task so the accept loop is never
+                    // set_nodelay is inside the spawned task so the accept loop is never
                     // stalled by a syscall before it can call accept() again.
                     if let Err(error) = crate::tcp_options::set_nodelay(&tcp_stream, tcp_nodelay) {
                         log::error!("Error: {}", error.display("\nCaused by: "));
@@ -338,10 +342,8 @@ async fn process_socket(
 ) -> Result<(), ProcessSocketError> {
     let udp_bind_addr = SocketAddr::new(udp_bind_ip, 0);
 
-    // Build UDP socket via socket2 to tune SO_RCVBUF/SO_SNDBUF, which Tokio's
-    // UdpSocket::bind does not expose. Larger buffers reduce kernel-side packet drops
-    // under the burst traffic typical of DNS-over-TCP workloads.
-    // FIX: requires socket2 = { version = "0.5", features = ["all"] } in Cargo.toml.
+    // socket2 is used here because tokio's UdpSocket::bind does not expose SO_RCVBUF /
+    // SO_SNDBUF. Larger buffers reduce kernel-side packet drops under burst traffic.
     let domain = match udp_bind_addr {
         SocketAddr::V4(..) => Domain::IPV4,
         SocketAddr::V6(..) => Domain::IPV6,
